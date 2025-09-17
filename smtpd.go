@@ -31,19 +31,62 @@ var (
 	mailSizeRE = regexp.MustCompile(`[Ss][Ii][Zz][Ee]=(\d+)`)
 )
 
+type AuthMach int
+
+const (
+	AuthNone AuthMach = iota
+	AuthPlain
+	AuthLogin
+	AuthCramMD5
+)
+
+func (a AuthMach) String() string {
+	switch a {
+	case AuthPlain:
+		return "PLAIN"
+	case AuthLogin:
+		return "LOGIN"
+	case AuthCramMD5:
+		return "CRAM-MD5"
+	default:
+		return "NONE"
+	}
+}
+
 // Handler function called upon successful receipt of an email.
 // Results in a "250 2.0.0 Ok: queued" response.
 type Handler func(remoteAddr net.Addr, from string, to []string, data []byte) error
+
+type HandlerWithCtx func(ctx *Context, msg Message) error
 
 // MsgIDHandler function called upon successful receipt of an email. Returns a message ID.
 // Results in a "250 2.0.0 Ok: queued as <message-id>" response.
 type MsgIDHandler func(remoteAddr net.Addr, from string, to []string, data []byte) (string, error)
 
+type MsgIDHandlerWithCtx func(ctx *Context, msg Message) (string, error)
+
 // HandlerRcpt function called on RCPT. Return accept status.
 type HandlerRcpt func(remoteAddr net.Addr, from string, to string) bool
 
+type HandlerRcptWithCtx func(ctx *Context, from string, to string) bool
+
 // AuthHandler function called when a login attempt is performed. Returns true if credentials are correct.
 type AuthHandler func(remoteAddr net.Addr, mechanism string, username []byte, password []byte, shared []byte) (bool, error)
+
+type AuthHandlerWithCtx func(ctx *Context) (bool, error)
+
+type Auth struct {
+	Mechanism AuthMach
+	Username  []byte
+	Password  []byte
+	Shared    []byte // This field is used exclusively with the "CRAM-MD5" authentication mechanism.
+}
+
+type Message struct {
+	From string
+	To   []string
+	Data []byte
+}
 
 var ErrServerClosed = errors.New("Server has been closed")
 
@@ -86,24 +129,28 @@ type LogFunc func(remoteIP, verb, line string)
 
 // Server is an SMTP server.
 type Server struct {
-	Addr              string // TCP address to listen on, defaults to ":25" (all addresses, port 25) if empty
-	Appname           string
-	AuthHandler       AuthHandler
-	AuthMechs         map[string]bool // Override list of allowed authentication mechanisms. Currently supported: LOGIN, PLAIN, CRAM-MD5. Enabling LOGIN and PLAIN will reduce RFC 4954 compliance.
-	AuthRequired      bool            // Require authentication for every command except AUTH, EHLO, HELO, NOOP, RSET or QUIT as per RFC 4954. Ignored if AuthHandler is not configured.
-	DisableReverseDNS bool            // Disable reverse DNS lookups, enforces "unknown" hostname
-	Handler           Handler
-	HandlerRcpt       HandlerRcpt
-	Hostname          string
-	LogRead           LogFunc
-	LogWrite          LogFunc
-	MaxSize           int // Maximum message size allowed, in bytes
-	MaxRecipients     int // Maximum number of recipients, defaults to 100.
-	MsgIDHandler      MsgIDHandler
-	Timeout           time.Duration
-	TLSConfig         *tls.Config
-	TLSListener       bool // Listen for incoming TLS connections only (not recommended as it may reduce compatibility). Ignored if TLS is not configured.
-	TLSRequired       bool // Require TLS for every command except NOOP, EHLO, STARTTLS, or QUIT as per RFC 3207. Ignored if TLS is not configured.
+	Addr                string // TCP address to listen on, defaults to ":25" (all addresses, port 25) if empty
+	Appname             string
+	AuthHandler         AuthHandler
+	AuthHandlerWithCtx  AuthHandlerWithCtx
+	AuthMechs           map[string]bool // Override list of allowed authentication mechanisms. Currently supported: LOGIN, PLAIN, CRAM-MD5. Enabling LOGIN and PLAIN will reduce RFC 4954 compliance.
+	AuthRequired        bool            // Require authentication for every command except AUTH, EHLO, HELO, NOOP, RSET or QUIT as per RFC 4954. Ignored if AuthHandler is not configured.
+	DisableReverseDNS   bool            // Disable reverse DNS lookups, enforces "unknown" hostname
+	Handler             Handler
+	HandlerWithCtx      HandlerWithCtx
+	HandlerRcpt         HandlerRcpt
+	HandlerRcptWithCtx  HandlerRcptWithCtx
+	Hostname            string
+	LogRead             LogFunc
+	LogWrite            LogFunc
+	MaxSize             int // Maximum message size allowed, in bytes
+	MaxRecipients       int // Maximum number of recipients, defaults to 100.
+	MsgIDHandler        MsgIDHandler
+	MsgIDHandlerWithCtx MsgIDHandlerWithCtx
+	Timeout             time.Duration
+	TLSConfig           *tls.Config
+	TLSListener         bool // Listen for incoming TLS connections only (not recommended as it may reduce compatibility). Ignored if TLS is not configured.
+	TLSRequired         bool // Require TLS for every command except NOOP, EHLO, STARTTLS, or QUIT as per RFC 3207. Ignored if TLS is not configured.
 
 	inShutdown   int32 // server was closed or shutdown
 	openSessions int32 // count of open sessions
@@ -111,6 +158,72 @@ type Server struct {
 	shutdownChan chan struct{} // let the sessions know we are shutting down
 
 	XClientAllowed []string // List of XCLIENT allowed IP addresses
+}
+
+// handleAuth executes the server's authentication handler.
+// If AuthHandler is set, it is called with the connection details.
+// Otherwise, AuthHandlerWithCtx is invoked.
+func (srv *Server) handleAuth(c *Context) (bool, error) {
+	if srv.AuthHandler != nil {
+		return srv.AuthHandler(c.remoteAddr, c.Mechanism().String(), c.Username(), c.Username(), c.Shared())
+	}
+
+	return srv.AuthHandlerWithCtx(c)
+}
+
+// handle dispatches the message to the server's handler.
+// If Handler is set, it is invoked directly; otherwise HandlerWithCtx is used.
+func (srv *Server) handle(c *Context, m Message) error {
+	if srv.Handler != nil {
+		return srv.Handler(c.remoteAddr, m.From, m.To, m.Data)
+	}
+
+	return srv.HandlerWithCtx(c, m)
+}
+
+// handleMsgId generates a message ID using the server's handler.
+// If MsgIDHandler is set, it is called directly; otherwise MsgIDHandlerWithCtx is used.
+func (srv *Server) handleMsgId(c *Context, m Message) (string, error) {
+	if srv.MsgIDHandler != nil {
+		return srv.MsgIDHandler(c.remoteAddr, m.From, m.To, m.Data)
+	}
+
+	return srv.MsgIDHandlerWithCtx(c, m)
+}
+
+// handleRcpt validates a recipient using the server's handler.
+// If HandlerRcpt is set, it is called directly; otherwise HandlerRcptWithCtx is used.
+func (srv *Server) handleRcpt(c *Context, from string, to string) bool {
+	if srv.HandlerRcpt != nil {
+		return srv.HandlerRcpt(c.remoteAddr, from, to)
+	}
+
+	return srv.HandlerRcptWithCtx(c, from, to)
+}
+
+// hasAuthHandler reports whether an authentication handler is configured.
+func (srv *Server) hasAuthHandler() bool {
+	return srv.AuthHandler != nil || srv.AuthHandlerWithCtx != nil
+}
+
+// hasHandler reports whether a message handler is configured.
+func (srv *Server) hasHandler() bool {
+	return srv.Handler != nil || srv.HandlerWithCtx != nil
+}
+
+// hasMsgIdHandler reports whether a message ID handler is configured.
+func (srv *Server) hasMsgIdHandler() bool {
+	return srv.MsgIDHandler != nil || srv.MsgIDHandlerWithCtx != nil
+}
+
+// hasRcptHandler reports whether a recipient handler is configured.
+func (srv *Server) hasRcptHandler() bool {
+	return srv.HandlerRcpt != nil || srv.HandlerRcptWithCtx != nil
+}
+
+// requiredAuth reports whether authentication is required by the server.
+func (srv *Server) requiredAuth() bool {
+	return srv.hasAuthHandler() && srv.AuthRequired
 }
 
 // ConfigureTLS creates a TLS configuration from certificate and key files.
@@ -221,11 +334,10 @@ func (srv *Server) Serve(ln net.Listener) error {
 	}
 }
 
-type session struct {
-	srv           *Server
-	conn          net.Conn
-	br            *bufio.Reader
-	bw            *bufio.Writer
+// Context holds the current session data and provides a shared state
+// between different handlers. It includes metadata and allows setting
+// and retrieving custom keys, enabling communication across handlers.
+type Context struct {
 	remoteIP      string // Remote IP address
 	remoteHost    string // Remote hostname according to reverse DNS lookup
 	remoteName    string // Remote hostname as supplied with EHLO
@@ -235,6 +347,85 @@ type session struct {
 	xClientTrust  bool   // Trust XCLIENT from current IP address
 	tls           bool
 	authenticated bool
+
+	remoteAddr net.Addr
+	auth       *Auth
+
+	// This mutex protects Keys map.
+	mu sync.RWMutex
+
+	// Keys is a key/value pair exclusively for the context of each request.
+	Keys map[string]interface{}
+}
+
+// RemoteAddr returns the remote network address associated with the session context.
+func (c *Context) RemoteAddr() net.Addr {
+	return c.remoteAddr
+}
+
+// Mechanism returns the authentication mechanism from the context.
+// If no authentication is set, it returns AuthNone.
+func (c *Context) Mechanism() AuthMach {
+	if c.auth == nil {
+		return AuthNone
+	}
+	return c.auth.Mechanism
+}
+
+// Username returns the authenticated username from the context.
+// It returns nil if no authentication is set.
+func (c *Context) Username() []byte {
+	if c.auth == nil {
+		return nil
+	}
+	return c.auth.Username
+}
+
+// Password returns the authenticated password from the context.
+// It returns nil if no authentication is set.
+func (c *Context) Password() []byte {
+	if c.auth == nil {
+		return nil
+	}
+	return c.auth.Password
+}
+
+// Shared returns the shared secret (used by "CRAM-MD5" auth mechanisms) from the context.
+// It returns nil if no authentication is set.
+func (c *Context) Shared() []byte {
+	if c.auth == nil {
+		return nil
+	}
+	return c.auth.Shared
+}
+
+// Set is used to store a new key/value pair exclusively for this context.
+// It also lazy initializes  c.Keys if it was not used previously.
+func (c *Context) Set(key string, value interface{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.Keys == nil {
+		c.Keys = make(map[string]interface{})
+	}
+
+	c.Keys[key] = value
+}
+
+// Get returns the value for the given key, ie: (value, true).
+// If the value does not exist it returns (nil, false)
+func (c *Context) Get(key string) (value interface{}, exists bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	value, exists = c.Keys[key]
+	return
+}
+
+type session struct {
+	srv  *Server
+	conn net.Conn
+	br   *bufio.Reader
+	bw   *bufio.Writer
+	c    *Context
 }
 
 // Create new session from connection.
@@ -244,27 +435,30 @@ func (srv *Server) newSession(conn net.Conn) (s *session) {
 		conn: conn,
 		br:   bufio.NewReader(conn),
 		bw:   bufio.NewWriter(conn),
+		c: &Context{
+			remoteAddr: conn.RemoteAddr(),
+		},
 	}
 
 	// Get remote end info for the Received header.
-	s.remoteIP, _, _ = net.SplitHostPort(s.conn.RemoteAddr().String())
+	s.c.remoteIP, _, _ = net.SplitHostPort(s.conn.RemoteAddr().String())
 	if !s.srv.DisableReverseDNS {
-		names, err := net.LookupAddr(s.remoteIP)
+		names, err := net.LookupAddr(s.c.remoteIP)
 		if err == nil && len(names) > 0 {
-			s.remoteHost = names[0]
+			s.c.remoteHost = names[0]
 		} else {
-			s.remoteHost = "unknown"
+			s.c.remoteHost = "unknown"
 		}
 	} else {
-		s.remoteHost = "unknown"
+		s.c.remoteHost = "unknown"
 	}
 
 	// Set tls = true if TLS is already in use.
-	_, s.tls = s.conn.(*tls.Conn)
+	_, s.c.tls = s.conn.(*tls.Conn)
 
 	for _, checkIP := range srv.XClientAllowed {
-		if s.remoteIP == checkIP {
-			s.xClientTrust = true
+		if s.c.remoteIP == checkIP {
+			s.c.xClientTrust = true
 		}
 	}
 	return
@@ -360,8 +554,8 @@ loop:
 
 		switch verb {
 		case "HELO":
-			s.remoteName = args
-			s.writef("250 %s greets %s", s.srv.Hostname, s.remoteName)
+			s.c.remoteName = args
+			s.writef("250 %s greets %s", s.srv.Hostname, s.c.remoteName)
 
 			// RFC 2821 section 4.1.4 specifies that EHLO has the same effect as RSET, so reset for HELO too.
 			from = ""
@@ -369,7 +563,7 @@ loop:
 			to = nil
 			buffer.Reset()
 		case "EHLO":
-			s.remoteName = args
+			s.c.remoteName = args
 			s.writef(s.makeEHLOResponse())
 
 			// RFC 2821 section 4.1.4 specifies that EHLO has the same effect as RSET.
@@ -378,11 +572,11 @@ loop:
 			to = nil
 			buffer.Reset()
 		case "MAIL":
-			if s.srv.TLSConfig != nil && s.srv.TLSRequired && !s.tls {
+			if s.srv.TLSConfig != nil && s.srv.TLSRequired && !s.c.tls {
 				s.writef("530 5.7.0 Must issue a STARTTLS command first")
 				break
 			}
-			if s.srv.AuthHandler != nil && s.srv.AuthRequired && !s.authenticated {
+			if s.srv.requiredAuth() && !s.c.authenticated {
 				s.writef("530 5.7.0 Authentication required")
 				break
 			}
@@ -419,11 +613,11 @@ loop:
 			to = nil
 			buffer.Reset()
 		case "RCPT":
-			if s.srv.TLSConfig != nil && s.srv.TLSRequired && !s.tls {
+			if s.srv.TLSConfig != nil && s.srv.TLSRequired && !s.c.tls {
 				s.writef("530 5.7.0 Must issue a STARTTLS command first")
 				break
 			}
-			if s.srv.AuthHandler != nil && s.srv.AuthRequired && !s.authenticated {
+			if s.srv.requiredAuth() && !s.c.authenticated {
 				s.writef("530 5.7.0 Authentication required")
 				break
 			}
@@ -444,8 +638,8 @@ loop:
 					s.writef("452 4.5.3 Too many recipients")
 				} else {
 					accept := true
-					if s.srv.HandlerRcpt != nil {
-						accept = s.srv.HandlerRcpt(s.conn.RemoteAddr(), from, match[1])
+					if s.srv.hasRcptHandler() {
+						accept = s.srv.handleRcpt(s.c, from, match[1])
 					}
 					if accept {
 						to = append(to, match[1])
@@ -456,11 +650,11 @@ loop:
 				}
 			}
 		case "DATA":
-			if s.srv.TLSConfig != nil && s.srv.TLSRequired && !s.tls {
+			if s.srv.TLSConfig != nil && s.srv.TLSRequired && !s.c.tls {
 				s.writef("530 5.7.0 Must issue a STARTTLS command first")
 				break
 			}
-			if s.srv.AuthHandler != nil && s.srv.AuthRequired && !s.authenticated {
+			if s.srv.requiredAuth() && !s.c.authenticated {
 				s.writef("530 5.7.0 Authentication required")
 				break
 			}
@@ -497,9 +691,15 @@ loop:
 			buffer.Write(s.makeHeaders(to))
 			buffer.Write(data)
 
+			m := Message{
+				From: from,
+				To:   to,
+				Data: buffer.Bytes(),
+			}
+
 			// Pass mail on to handler.
-			if s.srv.Handler != nil {
-				err := s.srv.Handler(s.conn.RemoteAddr(), from, to, buffer.Bytes())
+			if s.srv.hasHandler() {
+				err := s.srv.handle(s.c, m)
 				if err != nil {
 					checkErrFormat := regexp.MustCompile(`^([2-5][0-9]{2})[\s\-](.+)$`)
 					if checkErrFormat.MatchString(err.Error()) {
@@ -510,8 +710,8 @@ loop:
 					break
 				}
 				s.writef("250 2.0.0 Ok: queued")
-			} else if s.srv.MsgIDHandler != nil {
-				msgID, err := s.srv.MsgIDHandler(s.conn.RemoteAddr(), from, to, buffer.Bytes())
+			} else if s.srv.hasMsgIdHandler() {
+				msgID, err := s.srv.handleMsgId(s.c, m)
 				if err != nil {
 					checkErrFormat := regexp.MustCompile(`^([2-5][0-9]{2})[\s\-](.+)$`)
 					if checkErrFormat.MatchString(err.Error()) {
@@ -540,7 +740,7 @@ loop:
 			s.writef("221 2.0.0 %s %s ESMTP Service closing transmission channel", s.srv.Hostname, s.srv.Appname)
 			break loop
 		case "RSET":
-			if s.srv.TLSConfig != nil && s.srv.TLSRequired && !s.tls {
+			if s.srv.TLSConfig != nil && s.srv.TLSRequired && !s.c.tls {
 				s.writef("530 5.7.0 Must issue a STARTTLS command first")
 				break
 			}
@@ -552,30 +752,30 @@ loop:
 		case "NOOP":
 			s.writef("250 2.0.0 Ok")
 		case "XCLIENT":
-			s.xClient = args
-			if s.xClientTrust {
+			s.c.xClient = args
+			if s.c.xClientTrust {
 				xCArgs := strings.Split(args, " ")
 				for _, xCArg := range xCArgs {
 					xCParse := strings.Split(strings.TrimSpace(xCArg), "=")
 					if strings.ToUpper(xCParse[0]) == "ADDR" && (net.ParseIP(xCParse[1]) != nil) {
-						s.xClientADDR = xCParse[1]
+						s.c.xClientADDR = xCParse[1]
 					}
 					if strings.ToUpper(xCParse[0]) == "NAME" && len(xCParse[1]) > 0 {
 						if xCParse[1] != "[UNAVAILABLE]" {
-							s.xClientNAME = xCParse[1]
+							s.c.xClientNAME = xCParse[1]
 						}
 					}
 				}
-				if len(s.xClientADDR) > 7 {
-					s.remoteIP = s.xClientADDR
-					if len(s.xClientNAME) > 4 {
-						s.remoteHost = s.xClientNAME
+				if len(s.c.xClientADDR) > 7 {
+					s.c.remoteIP = s.c.xClientADDR
+					if len(s.c.xClientNAME) > 4 {
+						s.c.remoteHost = s.c.xClientNAME
 					} else {
-						names, err := net.LookupAddr(s.remoteIP)
+						names, err := net.LookupAddr(s.c.remoteIP)
 						if err == nil && len(names) > 0 {
-							s.remoteHost = names[0]
+							s.c.remoteHost = names[0]
 						} else {
-							s.remoteHost = "unknown"
+							s.c.remoteHost = "unknown"
 						}
 					}
 				}
@@ -598,7 +798,7 @@ loop:
 			}
 
 			// Handle case where STARTTLS is received when TLS is already in use.
-			if s.tls {
+			if s.c.tls {
 				s.writef("503 5.5.1 Bad sequence of commands (TLS already in use)")
 				break
 			}
@@ -617,27 +817,27 @@ loop:
 			s.conn = tlsConn
 			s.br = bufio.NewReader(s.conn)
 			s.bw = bufio.NewWriter(s.conn)
-			s.tls = true
+			s.c.tls = true
 
 			// RFC 3207 specifies that the server must discard any prior knowledge obtained from the client.
-			s.remoteName = ""
+			s.c.remoteName = ""
 			from = ""
 			gotFrom = false
 			to = nil
 			buffer.Reset()
 		case "AUTH":
-			if s.srv.TLSConfig != nil && s.srv.TLSRequired && !s.tls {
+			if s.srv.TLSConfig != nil && s.srv.TLSRequired && !s.c.tls {
 				s.writef("530 5.7.0 Must issue a STARTTLS command first")
 				break
 			}
 			// Handle case where AUTH is requested but not configured (and therefore not listed as a service extension).
-			if s.srv.AuthHandler == nil {
+			if !s.srv.hasAuthHandler() {
 				s.writef("502 5.5.1 Command not implemented")
 				break
 			}
 
 			// Handle case where AUTH is received when already authenticated.
-			if s.authenticated {
+			if s.c.authenticated {
 				s.writef("503 5.5.1 Bad sequence of commands (already authenticated for this session)")
 				break
 			}
@@ -667,11 +867,11 @@ loop:
 			// Many servers return 5.7.4 ("Security features not supported") instead.
 			switch authType {
 			case "PLAIN":
-				s.authenticated, err = s.handleAuthPlain(authArgs)
+				s.c.authenticated, err = s.handleAuthPlain(authArgs)
 			case "LOGIN":
-				s.authenticated, err = s.handleAuthLogin(authArgs)
+				s.c.authenticated, err = s.handleAuthLogin(authArgs)
 			case "CRAM-MD5":
-				s.authenticated, err = s.handleAuthCramMD5()
+				s.c.authenticated, err = s.handleAuthCramMD5()
 			}
 
 			if err != nil {
@@ -684,7 +884,7 @@ loop:
 				break
 			}
 
-			if s.authenticated {
+			if s.c.authenticated {
 				s.writef("235 2.7.0 Authentication successful")
 			} else {
 				s.writef("535 5.7.8 Authentication credentials invalid")
@@ -709,9 +909,9 @@ func (s *session) writef(format string, args ...interface{}) error {
 	if Debug {
 		verb := "WROTE"
 		if s.srv.LogWrite != nil {
-			s.srv.LogWrite(s.remoteIP, verb, line)
+			s.srv.LogWrite(s.c.remoteIP, verb, line)
 		} else {
-			log.Println(s.remoteIP, verb, line)
+			log.Println(s.c.remoteIP, verb, line)
 		}
 	}
 
@@ -733,9 +933,9 @@ func (s *session) readLine() (string, error) {
 	if Debug {
 		verb := "READ"
 		if s.srv.LogRead != nil {
-			s.srv.LogRead(s.remoteIP, verb, line)
+			s.srv.LogRead(s.c.remoteIP, verb, line)
 		} else {
-			log.Println(s.remoteIP, verb, line)
+			log.Println(s.c.remoteIP, verb, line)
 		}
 	}
 
@@ -793,7 +993,7 @@ func (s *session) readData() ([]byte, error) {
 func (s *session) makeHeaders(to []string) []byte {
 	var buffer bytes.Buffer
 	now := time.Now().Format("Mon, 2 Jan 2006 15:04:05 -0700 (MST)")
-	buffer.WriteString(fmt.Sprintf("Received: from %s (%s [%s])\r\n", s.remoteName, s.remoteHost, s.remoteIP))
+	buffer.WriteString(fmt.Sprintf("Received: from %s (%s [%s])\r\n", s.c.remoteName, s.c.remoteHost, s.c.remoteIP))
 	buffer.WriteString(fmt.Sprintf("        by %s (%s) with SMTP\r\n", s.srv.Hostname, s.srv.Appname))
 	buffer.WriteString(fmt.Sprintf("        for <%s>; %s\r\n", to[0], now))
 	return buffer.Bytes()
@@ -803,7 +1003,7 @@ func (s *session) makeHeaders(to []string) []byte {
 // RFC 4954 specifies that plaintext authentication mechanisms such as LOGIN and PLAIN require a TLS connection.
 // This can be explicitly overridden e.g. setting s.srv.AuthMechs["LOGIN"] = true.
 func (s *session) authMechs() (mechs map[string]bool) {
-	mechs = map[string]bool{"LOGIN": s.tls, "PLAIN": s.tls, "CRAM-MD5": true}
+	mechs = map[string]bool{"LOGIN": s.c.tls, "PLAIN": s.c.tls, "CRAM-MD5": true}
 
 	for mech := range mechs {
 		allowed, found := s.srv.AuthMechs[mech]
@@ -817,18 +1017,18 @@ func (s *session) authMechs() (mechs map[string]bool) {
 
 // Create the greeting string sent in response to an EHLO command.
 func (s *session) makeEHLOResponse() (response string) {
-	response = fmt.Sprintf("250-%s greets %s\r\n", s.srv.Hostname, s.remoteName)
+	response = fmt.Sprintf("250-%s greets %s\r\n", s.srv.Hostname, s.c.remoteName)
 
 	// RFC 1870 specifies that "SIZE 0" indicates no maximum size is in force.
 	response += fmt.Sprintf("250-SIZE %d\r\n", s.srv.MaxSize)
 
 	// Only list STARTTLS if TLS is configured, but not currently in use.
-	if s.srv.TLSConfig != nil && !s.tls {
+	if s.srv.TLSConfig != nil && !s.c.tls {
 		response += "250-STARTTLS\r\n"
 	}
 
 	// Only list AUTH if an AuthHandler is configured and at least one mechanism is allowed.
-	if s.srv.AuthHandler != nil {
+	if s.srv.hasAuthHandler() {
 		var mechs []string
 		for mech, allowed := range s.authMechs() {
 			if allowed {
@@ -871,8 +1071,14 @@ func (s *session) handleAuthLogin(arg string) (bool, error) {
 		return false, errors.New("501 5.5.2 Syntax error (unable to decode)")
 	}
 
+	s.c.auth = &Auth{
+		Mechanism: AuthLogin,
+		Username:  username,
+		Password:  password,
+	}
+
 	// Validate credentials.
-	authenticated, err := s.srv.AuthHandler(s.conn.RemoteAddr(), "LOGIN", username, password, nil)
+	authenticated, err := s.srv.handleAuth(s.c)
 
 	return authenticated, err
 }
@@ -899,8 +1105,14 @@ func (s *session) handleAuthPlain(arg string) (bool, error) {
 		return false, errors.New("501 5.5.2 Syntax error (unable to parse)")
 	}
 
+	s.c.auth = &Auth{
+		Mechanism: AuthLogin,
+		Username:  parts[1],
+		Password:  parts[2],
+	}
+
 	// Validate credentials.
-	authenticated, err := s.srv.AuthHandler(s.conn.RemoteAddr(), "PLAIN", parts[1], parts[2], nil)
+	authenticated, err := s.srv.handleAuth(s.c)
 
 	return authenticated, err
 }
@@ -929,8 +1141,15 @@ func (s *session) handleAuthCramMD5() (bool, error) {
 		return false, errors.New("501 5.5.2 Syntax error (unable to parse)")
 	}
 
+	s.c.auth = &Auth{
+		Mechanism: AuthCramMD5,
+		Username:  []byte(fields[0]),
+		Password:  []byte(fields[1]),
+		Shared:    []byte(shared),
+	}
+
 	// Validate credentials.
-	authenticated, err := s.srv.AuthHandler(s.conn.RemoteAddr(), "CRAM-MD5", []byte(fields[0]), []byte(fields[1]), []byte(shared))
+	authenticated, err := s.srv.handleAuth(s.c)
 
 	return authenticated, err
 }

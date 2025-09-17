@@ -540,7 +540,7 @@ func TestMakeHeaders(t *testing.T) {
 		fmt.Sprintf("%s\r\n", now)
 
 	srv := &Server{Appname: "smtpd", Hostname: "serverName"}
-	s := &session{srv: srv, remoteIP: "clientIP", remoteHost: "clientHost", remoteName: "clientName"}
+	s := &session{srv: srv, c: &Context{remoteIP: "clientIP", remoteHost: "clientHost", remoteName: "clientName"}}
 	headers := s.makeHeaders([]string{"recipient@example.com"})
 	if string(headers) != valid {
 		t.Errorf("makeHeaders() returned\n%v, want\n%v", string(headers), valid)
@@ -559,7 +559,7 @@ func TestParseLine(t *testing.T) {
 		{"RCPT TO:<recipient@example.com>", "RCPT", "TO:<recipient@example.com>"},
 		{"QUIT", "QUIT", ""},
 	}
-	s := &session{}
+	s := &session{c: &Context{}}
 	for _, tt := range tests {
 		verb, args := s.parseLine(tt.line)
 		if verb != tt.verb || args != tt.args {
@@ -571,7 +571,7 @@ func TestParseLine(t *testing.T) {
 // Test reading of complete lines from the socket.
 func TestReadLine(t *testing.T) {
 	var buf bytes.Buffer
-	s := &session{}
+	s := &session{c: &Context{}}
 	s.srv = &Server{}
 	s.br = bufio.NewReader(&buf)
 
@@ -615,7 +615,7 @@ func TestReadData(t *testing.T) {
 		{"Line 1.\r\n..Line 2.\r\nLine 3.\r\n.\r\n", "Line 1.\r\n.Line 2.\r\nLine 3.\r\n"},
 	}
 	var buf bytes.Buffer
-	s := &session{}
+	s := &session{c: &Context{}}
 	s.srv = &Server{}
 	s.br = bufio.NewReader(&buf)
 
@@ -656,7 +656,7 @@ func TestReadDataWithMaxSize(t *testing.T) {
 		{"Test message.\r\n.\r\n", 14, maxSizeExceeded(14)},
 	}
 	var buf bytes.Buffer
-	s := &session{}
+	s := &session{c: &Context{}}
 	s.br = bufio.NewReader(&buf)
 
 	for _, tt := range tests {
@@ -715,7 +715,7 @@ func authHandler(remoteAddr net.Addr, mechanism string, username []byte, passwor
 
 // Test the extensions listed in response to an EHLO command.
 func TestMakeEHLOResponse(t *testing.T) {
-	s := &session{}
+	s := &session{c: &Context{}}
 	s.srv = &Server{}
 
 	// Greeting should be returned without trailing newlines.
@@ -738,7 +738,7 @@ func TestMakeEHLOResponse(t *testing.T) {
 	}
 
 	// If TLS is already used on the connection, STARTTLS should not appear.
-	s.tls = true
+	s.c.tls = true
 	extensions = parseExtensions(t, s.makeEHLOResponse())
 	if _, ok := extensions["STARTTLS"]; ok {
 		t.Errorf("STARTTLS appears in the extension list when TLS is already in use")
@@ -783,7 +783,7 @@ func TestMakeEHLOResponse(t *testing.T) {
 	rePlain := regexp.MustCompile("\\bPLAIN\\b")
 
 	// RFC 4954 specifies that, without TLS in use, plaintext authentication mechanisms must not be advertised.
-	s.tls = false
+	s.c.tls = false
 	extensions = parseExtensions(t, s.makeEHLOResponse())
 	if reLogin.MatchString(extensions["AUTH"]) {
 		t.Errorf("AUTH mechanism LOGIN appears in the extension list when an AuthHandler is specified and TLS is not in use")
@@ -793,7 +793,7 @@ func TestMakeEHLOResponse(t *testing.T) {
 	}
 
 	// RFC 4954 specifies that, with TLS in use, plaintext authentication mechanisms can be advertised.
-	s.tls = true
+	s.c.tls = true
 	extensions = parseExtensions(t, s.makeEHLOResponse())
 	if !reLogin.MatchString(extensions["AUTH"]) {
 		t.Errorf("AUTH mechanism LOGIN does not appear in the extension list when an AuthHandler is specified and TLS is in use")
@@ -909,7 +909,7 @@ func TestConfigureTLSWithPassphrase(t *testing.T) {
 }
 
 func TestAuthMechs(t *testing.T) {
-	s := session{}
+	s := session{c: &Context{}}
 	s.srv = &Server{}
 
 	// Validate that non-TLS (default) configuration does not allow plaintext authentication mechanisms.
@@ -921,7 +921,7 @@ func TestAuthMechs(t *testing.T) {
 
 	// Validate that TLS configuration allows plaintext authentication mechanisms.
 	correct = map[string]bool{"LOGIN": true, "PLAIN": true, "CRAM-MD5": true}
-	s.tls = true
+	s.c.tls = true
 	mechs = s.authMechs()
 	if !reflect.DeepEqual(mechs, correct) {
 		t.Errorf("authMechs() returned %v, want %v", mechs, correct)
@@ -929,7 +929,7 @@ func TestAuthMechs(t *testing.T) {
 
 	// Validate that overridden values take precedence over RFC compliance when not using TLS.
 	correct = map[string]bool{"LOGIN": true, "PLAIN": true, "CRAM-MD5": false}
-	s.tls = false
+	s.c.tls = false
 	s.srv.AuthMechs = map[string]bool{"LOGIN": true, "PLAIN": true, "CRAM-MD5": false}
 	mechs = s.authMechs()
 	if !reflect.DeepEqual(mechs, correct) {
@@ -938,7 +938,7 @@ func TestAuthMechs(t *testing.T) {
 
 	// Validate that overridden values take precedence over RFC compliance when using TLS.
 	correct = map[string]bool{"LOGIN": false, "PLAIN": false, "CRAM-MD5": true}
-	s.tls = true
+	s.c.tls = true
 	s.srv.AuthMechs = map[string]bool{"LOGIN": false, "PLAIN": false, "CRAM-MD5": true}
 	mechs = s.authMechs()
 	if !reflect.DeepEqual(mechs, correct) {
