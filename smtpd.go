@@ -1106,7 +1106,7 @@ func (s *session) handleAuthPlain(arg string) (bool, error) {
 	}
 
 	s.c.auth = &Auth{
-		Mechanism: AuthLogin,
+		Mechanism: AuthPlain,
 		Username:  parts[1],
 		Password:  parts[2],
 	}
