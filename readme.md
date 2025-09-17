@@ -113,6 +113,52 @@ srv := &smtpd.Server{AuthMechs: mechs, ...}
 
 The Go SMTP client cancels the authentication exchange by sending an asterisk to the server after a failed authentication attempt. The server will ignore this behaviour.
 
+## `Context` Struct
+
+The `Context` struct provides session-specific data for an SMTP connection.  
+It allows handlers to share metadata, authentication information, and custom key/value pairs across a single session.
+
+### Public Methods
+`RemoteAddr() net.Addr` 
+
+Returns the remote network address associated with the session context.
+
+`Mechanism() AuthMach`
+
+Returns the authentication mechanism used for this session.
+If no authentication is set, it returns AuthNone.
+
+`Username() []byte`
+
+Returns the authenticated username. Returns `nil` if no authentication is set.
+
+`Password() []byte`
+
+Returns the authenticated password. Returns `nil` if no authentication is set.
+
+`Shared() []byte`
+
+Returns the shared secret used for `"CRAM-MD5"` authentication mechanisms. Returns `nil` if no authentication is set.
+
+`Set(key string, value interface{})`
+
+Stores a key/value pair in the context. Useful for sharing metadata between handlers.
+The key/value store is lazily initialized if it hasn’t been used before.
+
+```go
+ctx.Set("user_id", 12345)
+```
+
+`Get(key string) (interface{}, bool)`
+
+Retrieves a value for a given key. Returns (value, true) if found, or (nil, false) if not.
+
+```go
+if val, ok := ctx.Get("user_id"); ok {
+    fmt.Println("User ID:", val)
+}
+```
+
 ## Example
 
 The following example code creates a new server with the name "MyServerApp" that listens on the localhost address and port 2525. Upon receipt of a new mail message, the handler function parses the mail and prints the subject header.
@@ -204,6 +250,79 @@ ListenAndServe("127.0.0.1:2525", mailHandler, authHandler)
 ```
 
 This allows AUTH to be listed as a supported extension, CRAM-MD5 as a supported mechanism, and allows clients to authenticate by sending an AUTH command.
+
+## Advanced Usage: Context-Aware Handlers
+
+The `*WithCtx` handlers allow you to access a shared `Context` object for each SMTP session.  
+This makes it possible to store metadata, track session state, or share information between handlers during a single connection.
+
+### Available Context-Aware Handlers
+
+| Handler | Description |
+|---------|-------------|
+| `HandlerWithCtx` | Called on successful receipt of an email. Receives the session `Context` and the full `Message`. |
+| `MsgIDHandlerWithCtx` | Called on successful receipt of an email. Returns a message ID. |
+| `HandlerRcptWithCtx` | Called on RCPT commands. Returns a boolean indicating accept status. |
+| `AuthHandlerWithCtx` | Called during authentication. Returns `true` if credentials are valid. |
+
+### Example: Using `Context` in Handlers
+
+```go
+package main
+
+import (
+    "fmt"
+    "net"
+    "github.com/mhale/smtpd"
+)
+
+func main() {
+    srv := &smtpd.Server{
+        Addr: ":2525",
+
+        // Context-aware authentication handler
+        AuthHandlerWithCtx: func(ctx *smtpd.Context) (bool, error) {
+            username := string(ctx.Username())
+            fmt.Println("Login attempt from:", ctx.RemoteAddr(), "Username:", username)
+
+            // Store something in context for later handlers
+            ctx.Set("user_role", "admin")
+
+            return username == "test", nil
+        },
+
+        // Context-aware recipient handler
+        HandlerRcptWithCtx: func(ctx *smtpd.Context, from string, to string) bool {
+            // Retrieve metadata from context
+            if role, ok := ctx.Get("user_role"); ok {
+                fmt.Println("User role:", role)
+            }
+
+            // Accept all recipients
+            return true
+        },
+
+        // Context-aware message handler
+        HandlerWithCtx: func(ctx *smtpd.Context, msg smtpd.Message) error {
+            fmt.Printf("Message from %s to %v received\n", msg.From, msg.To)
+            fmt.Println("Metadata:", ctx.Keys) // Access all stored keys
+            return nil
+        },
+    }
+
+    fmt.Println("SMTP server running on", srv.Addr)
+    if err := srv.ListenAndServe(); err != nil {
+        fmt.Println("Server error:", err)
+    }
+}
+```
+
+### Key Points
+
+- The `Context` struct is unique per session and shared across all handlers.
+- You can store and retrieve arbitrary key/value pairs using `Set` and `Get`.
+- `Mechanism`, `Username`, `Password`, and `Shared` provide session authentication details.
+- Legacy handlers (without `*WithCtx`) are still supported and prioritized if set.
 
 ## Testing
 
