@@ -65,20 +65,6 @@ func parseAuthMech(s string) (AuthMech, bool) {
 	}
 }
 
-// Handler function called upon successful receipt of an email.
-// Results in a "250 2.0.0 Ok: queued" response.
-type Handler func(ctx *Context, msg Message) error
-
-// MsgIDHandler function called upon successful receipt of an email. Returns a message ID.
-// Results in a "250 2.0.0 Ok: queued as <message-id>" response.
-type MsgIDHandler func(ctx *Context, msg Message) (string, error)
-
-// HandlerRcpt function called on RCPT. Return accept status.
-type HandlerRcpt func(ctx *Context, from string, to string) bool
-
-// AuthHandler function called when a login attempt is performed. Returns true if credentials are correct.
-type AuthHandler func(ctx *Context) (bool, error)
-
 type Auth struct {
 	Mechanism AuthMech
 	Username  []byte
@@ -91,6 +77,33 @@ type Message struct {
 	To   []string
 	Data []byte
 }
+
+type Response struct {
+	Code int
+	RFC  string
+	Msg  string
+}
+
+func (r *Response) String() string {
+	res := fmt.Sprintf("%d ", r.Code)
+	if r.RFC != "" {
+		res += r.RFC + " "
+	}
+
+	return res + r.Msg
+}
+
+// Handler function called upon successful receipt of an email.
+// Results in a "250 2.0.0 Ok: queued" response.
+type Handler func(ctx *Context, msg Message) (*Response, error)
+
+// HandlerRcpt function called on RCPT. Return accept status.
+type HandlerRcpt func(ctx *Context, from string, to string) bool
+
+// AuthHandler function called when a login attempt is performed. Returns true if credentials are correct.
+type AuthHandler func(ctx *Context) (bool, error)
+
+type SessionHook func(ctx *Context)
 
 var ErrServerClosed = errors.New("Server has been closed")
 
@@ -136,6 +149,8 @@ type Server struct {
 	Addr              string // TCP address to listen on, defaults to ":25" (all addresses, port 25) if empty
 	Appname           string
 	AuthHandler       AuthHandler
+	NewSessionHook    SessionHook
+	EndSessionHook    SessionHook
 	AuthMechs         map[AuthMech]bool // Override list of allowed authentication mechanisms. Currently supported: LOGIN, PLAIN, CRAM-MD5. Enabling LOGIN and PLAIN will reduce RFC 4954 compliance.
 	AuthRequired      bool              // Require authentication for every command except AUTH, EHLO, HELO, NOOP, RSET or QUIT as per RFC 4954. Ignored if AuthHandler is not configured.
 	DisableReverseDNS bool              // Disable reverse DNS lookups, enforces "unknown" hostname
@@ -146,7 +161,6 @@ type Server struct {
 	LogWrite          LogFunc
 	MaxSize           int // Maximum message size allowed, in bytes
 	MaxRecipients     int // Maximum number of recipients, defaults to 100.
-	MsgIDHandler      MsgIDHandler
 	Timeout           time.Duration
 	TLSConfig         *tls.Config
 	TLSListener       bool // Listen for incoming TLS connections only (not recommended as it may reduce compatibility). Ignored if TLS is not configured.
@@ -271,9 +285,21 @@ func (srv *Server) Serve(ln net.Listener) error {
 			return err
 		}
 
-		session := srv.newSession(conn)
+		s := srv.newSession(conn)
 		atomic.AddInt32(&srv.openSessions, 1)
-		go session.serve()
+
+		if srv.NewSessionHook != nil {
+			srv.NewSessionHook(s.c)
+		}
+
+		go func(s *session) {
+			defer func() {
+				if s.srv.EndSessionHook != nil {
+					s.srv.EndSessionHook(s.c)
+				}
+			}()
+			s.serve()
+		}(s)
 	}
 }
 
@@ -642,19 +668,7 @@ loop:
 
 			// Pass mail on to handler.
 			if s.srv.Handler != nil {
-				err := s.srv.Handler(s.c, m)
-				if err != nil {
-					checkErrFormat := regexp.MustCompile(`^([2-5][0-9]{2})[\s\-](.+)$`)
-					if checkErrFormat.MatchString(err.Error()) {
-						s.writef("%s", err.Error())
-					} else {
-						s.writef("451 4.3.5 Unable to process mail")
-					}
-					break
-				}
-				s.writef("250 2.0.0 Ok: queued")
-			} else if s.srv.MsgIDHandler != nil {
-				msgID, err := s.srv.MsgIDHandler(s.c, m)
+				res, err := s.srv.Handler(s.c, m)
 				if err != nil {
 					checkErrFormat := regexp.MustCompile(`^([2-5][0-9]{2})[\s\-](.+)$`)
 					if checkErrFormat.MatchString(err.Error()) {
@@ -665,8 +679,8 @@ loop:
 					break
 				}
 
-				if msgID != "" {
-					s.writef("250 2.0.0 Ok: queued as %s", msgID)
+				if res != nil {
+					s.writef("%s", res.String())
 				} else {
 					s.writef("250 2.0.0 Ok: queued")
 				}

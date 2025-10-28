@@ -311,10 +311,10 @@ type mockHandler struct {
 	handlerCalled int
 }
 
-func (m *mockHandler) handler(err error) func(c *Context, msg Message) error {
-	return func(c *Context, msg Message) error {
+func (m *mockHandler) handler(err error) func(c *Context, msg Message) (*Response, error) {
+	return func(c *Context, msg Message) (*Response, error) {
 		m.handlerCalled++
-		return err
+		return nil, err
 	}
 }
 
