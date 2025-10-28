@@ -796,14 +796,18 @@ loop:
 
 			// RFC 4954 requires a mechanism parameter.
 			authType, authArgs := s.parseLine(args)
-			authMach, ok := parseAuthMech(authType)
-
-			if !ok {
+			if authType == "" {
 				s.writef("501 5.5.4 Malformed AUTH input (argument required)")
 				break
 			}
 
 			// RFC 4954 requires rejecting unsupported authentication mechanisms with a 504 response.
+			authMach, ok := parseAuthMech(authType)
+			if !ok {
+				s.writef("504 5.5.4 Unrecognized authentication type")
+				break
+			}
+
 			allowedAuth := s.authMechs()
 			if allowed, found := allowedAuth[authMach]; !found || !allowed {
 				s.writef("504 5.5.4 Unrecognized authentication type")
