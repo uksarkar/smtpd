@@ -38,7 +38,7 @@ func ListenAndServeTLS(addr string, certFile string, keyFile string, handler Han
 The handler function must have the following definition:
 
 ```go
-func handler(remoteAddr net.Addr, from string, to []string, data []byte)
+func handler(c *Context, m Message)
 ```
 
 The parameters are:
@@ -100,14 +100,14 @@ If both TLS and authentication are required, the TLS requirements take priority.
 RFC 4954 specifies that the LOGIN and PLAIN mechanisms require TLS to be in use as they send the password in plaintext. By default, smtpd follows this requirement, and will not advertise or allow LOGIN and PLAIN until a TLS connection is established. This behaviour can be overridden during testing by using the AuthMechs option. For example, to enable the PLAIN mechanism regardless of TLS:
 
 ```go
-mechs := map[string]bool{"PLAIN": true}
+mechs := map[string]bool{AuthPlain: true}
 srv := &smtpd.Server{AuthMechs: mechs, ...}
 ```
 
 The LOGIN and PLAIN mechanisms send the password to the server, but CRAM-MD5 does not - it sends a hash of the password, with a salt supplied by the server. In order to authenticate a session using CRAM-MD5, the server must have access to the plaintext password so it can hash it with the same salt and compare it to the hash sent by the client. If passwords are stored in a hashed format (and they should be), they cannot be transformed into plaintext, and therefore CRAM-MD5 cannot be used. To disable the CRAM-MD5 mechanism:
 
 ```go
-mechs := map[string]bool{"CRAM-MD5": false}
+mechs := map[string]bool{AuthCramMD5: false}
 srv := &smtpd.Server{AuthMechs: mechs, ...}
 ```
 
@@ -172,13 +172,13 @@ import (
     "net"
     "net/mail"
 
-    "github.com/mhale/smtpd"
+    "github.com/uksarkar/smtpd"
 )
 
-func mailHandler(origin net.Addr, from string, to []string, data []byte) error {
-    msg, _ := mail.ReadMessage(bytes.NewReader(data))
+func mailHandler(c *Context, m Message) error {
+    msg, _ := mail.ReadMessage(bytes.NewReader(m.Data))
     subject := msg.Header.Get("Subject")
-    log.Printf("Received mail from %s for %s with subject %s", from, to[0], subject)
+    log.Printf("Received mail from %s for %s with subject %s", m.From, m.To[0], subject)
     return nil
 }
 
@@ -206,7 +206,7 @@ As the package level helper functions do not set the TLSRequired or TLSListener 
 With the same ```mailHandler``` as above:
 
 ```go
-func rcptHandler(remoteAddr net.Addr, from string, to string) bool {
+func rcptHandler(c *Context, from string, to string) bool {
     domain = getDomain(to)
     return domain == "mail.example.com"
 }
@@ -230,11 +230,11 @@ ListenAndServe("127.0.0.1:2525", mailHandler, rcptHandler)
 With the same ```mailHandler``` as above:
 
 ```go
-func authHandler(remoteAddr net.Addr, mechanism string, username []byte, password []byte, shared []byte) (bool, error) {
-    return string(username) == "valid" && string(password) == "password", nil
+func authHandler(c *Context) (bool, error) {
+    return string(c.Username()) == "valid" && string(c.Password()) == "password", nil
 }
 
-func ListenAndServe(addr string, handler smtpd.Handler, authHandler smtpd.AuthHandler) error {
+func ListenAndServe(c *Context) error {
     srv := &smtpd.Server{
         Addr:        addr,
         Handler:     handler,
@@ -250,72 +250,6 @@ ListenAndServe("127.0.0.1:2525", mailHandler, authHandler)
 ```
 
 This allows AUTH to be listed as a supported extension, CRAM-MD5 as a supported mechanism, and allows clients to authenticate by sending an AUTH command.
-
-## Advanced Usage: Context-Aware Handlers
-
-The `*WithCtx` handlers allow you to access a shared `Context` object for each SMTP session.  
-This makes it possible to store metadata, track session state, or share information between handlers during a single connection.
-
-### Available Context-Aware Handlers
-
-| Handler | Description |
-|---------|-------------|
-| `HandlerWithCtx` | Called on successful receipt of an email. Receives the session `Context` and the full `Message`. |
-| `MsgIDHandlerWithCtx` | Called on successful receipt of an email. Returns a message ID. |
-| `HandlerRcptWithCtx` | Called on RCPT commands. Returns a boolean indicating accept status. |
-| `AuthHandlerWithCtx` | Called during authentication. Returns `true` if credentials are valid. |
-
-### Example: Using `Context` in Handlers
-
-```go
-package main
-
-import (
-    "fmt"
-    "net"
-    "github.com/mhale/smtpd"
-)
-
-func main() {
-    srv := &smtpd.Server{
-        Addr: ":2525",
-
-        // Context-aware authentication handler
-        AuthHandlerWithCtx: func(ctx *smtpd.Context) (bool, error) {
-            username := string(ctx.Username())
-            fmt.Println("Login attempt from:", ctx.RemoteAddr(), "Username:", username)
-
-            // Store something in context for later handlers
-            ctx.Set("user_role", "admin")
-
-            return username == "test", nil
-        },
-
-        // Context-aware recipient handler
-        HandlerRcptWithCtx: func(ctx *smtpd.Context, from string, to string) bool {
-            // Retrieve metadata from context
-            if role, ok := ctx.Get("user_role"); ok {
-                fmt.Println("User role:", role)
-            }
-
-            // Accept all recipients
-            return true
-        },
-
-        // Context-aware message handler
-        HandlerWithCtx: func(ctx *smtpd.Context, msg smtpd.Message) error {
-            fmt.Printf("Message from %s to %v received\n", msg.From, msg.To)
-            fmt.Println("Metadata:", ctx.Keys) // Access all stored keys
-            return nil
-        },
-    }
-
-    fmt.Println("SMTP server running on", srv.Addr)
-    if err := srv.ListenAndServe(); err != nil {
-        fmt.Println("Server error:", err)
-    }
-}
-```
 
 ### Key Points
 
