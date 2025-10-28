@@ -11,7 +11,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -187,11 +186,11 @@ func (srv *Server) ConfigureTLSWithPassphrase(
 	keyFile string,
 	passphrase string,
 ) error {
-	certPEMBlock, err := ioutil.ReadFile(certFile)
+	certPEMBlock, err := os.ReadFile(certFile)
 	if err != nil {
 		return err
 	}
-	keyPEMBlock, err := ioutil.ReadFile(keyFile)
+	keyPEMBlock, err := os.ReadFile(keyFile)
 	if err != nil {
 		return err
 	}
@@ -508,7 +507,7 @@ loop:
 			buffer.Reset()
 		case "EHLO":
 			s.c.remoteName = args
-			s.writef(s.makeEHLOResponse())
+			s.writef("%s", s.makeEHLOResponse())
 
 			// RFC 2821 section 4.1.4 specifies that EHLO has the same effect as RSET.
 			from = ""
@@ -541,7 +540,7 @@ loop:
 							s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid SIZE parameter)")
 						} else if s.srv.MaxSize > 0 && size > s.srv.MaxSize { // SIZE above maximum size, if set
 							err = maxSizeExceeded(s.srv.MaxSize)
-							s.writef(err.Error())
+							s.writef("%s", err.Error())
 						} else { // SIZE ok
 							from = match[1]
 							gotFrom = true
@@ -615,14 +614,14 @@ loop:
 			// On other errors, allow the client to try again.
 			data, err := s.readData()
 			if err != nil {
-				switch err.(type) {
+				switch err := err.(type) {
 				case net.Error:
-					if err.(net.Error).Timeout() {
+					if err.Timeout() {
 						s.writef("421 4.4.2 %s %s ESMTP Service closing transmission channel after timeout exceeded", s.srv.Hostname, s.srv.Appname)
 					}
 					break loop
 				case maxSizeExceededError:
-					s.writef(err.Error())
+					s.writef("%s", err.Error())
 					continue
 				default:
 					s.writef("451 4.3.0 Requested action aborted: local error in processing")
@@ -647,7 +646,7 @@ loop:
 				if err != nil {
 					checkErrFormat := regexp.MustCompile(`^([2-5][0-9]{2})[\s\-](.+)$`)
 					if checkErrFormat.MatchString(err.Error()) {
-						s.writef(err.Error())
+						s.writef("%s", err.Error())
 					} else {
 						s.writef("451 4.3.5 Unable to process mail")
 					}
@@ -659,7 +658,7 @@ loop:
 				if err != nil {
 					checkErrFormat := regexp.MustCompile(`^([2-5][0-9]{2})[\s\-](.+)$`)
 					if checkErrFormat.MatchString(err.Error()) {
-						s.writef(err.Error())
+						s.writef("%s", err.Error())
 					} else {
 						s.writef("451 4.3.5 Unable to process mail")
 					}
@@ -667,7 +666,7 @@ loop:
 				}
 
 				if msgID != "" {
-					s.writef("250 2.0.0 Ok: queued as " + msgID)
+					s.writef("250 2.0.0 Ok: queued as %s", msgID)
 				} else {
 					s.writef("250 2.0.0 Ok: queued")
 				}
@@ -830,7 +829,7 @@ loop:
 					break loop
 				}
 
-				s.writef(err.Error())
+				s.writef("%s", err.Error())
 				break
 			}
 
@@ -847,13 +846,13 @@ loop:
 }
 
 // Wrapper function for writing a complete line to the socket.
-func (s *session) writef(format string, args ...interface{}) error {
+func (s *session) writef(format string, args ...any) error {
 	if s.srv.Timeout > 0 {
 		s.conn.SetWriteDeadline(time.Now().Add(s.srv.Timeout))
 	}
 
 	line := fmt.Sprintf(format, args...)
-	fmt.Fprintf(s.bw, line+"\r\n")
+	fmt.Fprintf(s.bw, "%s", line+"\r\n")
 	err := s.bw.Flush()
 
 	if Debug {
@@ -998,7 +997,7 @@ func (s *session) handleAuthLogin(arg string) (bool, error) {
 	var err error
 
 	if arg == "" {
-		s.writef("334 " + base64.StdEncoding.EncodeToString([]byte("Username:")))
+		s.writef("334 %s", base64.StdEncoding.EncodeToString([]byte("Username:")))
 		arg, err = s.readLine()
 		if err != nil {
 			return false, err
@@ -1010,7 +1009,7 @@ func (s *session) handleAuthLogin(arg string) (bool, error) {
 		return false, errors.New("501 5.5.2 Syntax error (unable to decode)")
 	}
 
-	s.writef("334 " + base64.StdEncoding.EncodeToString([]byte("Password:")))
+	s.writef("334 %s", base64.StdEncoding.EncodeToString([]byte("Password:")))
 	line, err := s.readLine()
 	if err != nil {
 		return false, err
@@ -1066,7 +1065,7 @@ func (s *session) handleAuthPlain(arg string) (bool, error) {
 func (s *session) handleAuthCramMD5() (bool, error) {
 	shared := "<" + strconv.Itoa(os.Getpid()) + "." + strconv.Itoa(time.Now().Nanosecond()) + "@" + s.srv.Hostname + ">"
 
-	s.writef("334 " + base64.StdEncoding.EncodeToString([]byte(shared)))
+	s.writef("334 %s", base64.StdEncoding.EncodeToString([]byte(shared)))
 
 	data, err := s.readLine()
 	if err != nil {
