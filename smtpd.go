@@ -61,8 +61,6 @@ func parseAuthMech(s string) (AuthMech, bool) {
 		return AuthLogin, true
 	case "CRAM-MD5":
 		return AuthCramMD5, true
-	case "NONE":
-		return AuthNone, true
 	default:
 		return AuthNone, false
 	}
