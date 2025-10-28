@@ -311,8 +311,8 @@ type mockHandler struct {
 	handlerCalled int
 }
 
-func (m *mockHandler) handler(err error) func(a net.Addr, f string, t []string, d []byte) error {
-	return func(a net.Addr, f string, t []string, d []byte) error {
+func (m *mockHandler) handler(err error) func(c *Context, msg Message) error {
+	return func(c *Context, msg Message) error {
 		m.handlerCalled++
 		return err
 	}
@@ -709,8 +709,8 @@ func parseExtensions(t *testing.T, greeting string) map[string]string {
 
 // Handler function for validating authentication credentials.
 // The secret parameter is passed as nil for LOGIN and PLAIN authentication mechanisms.
-func authHandler(remoteAddr net.Addr, mechanism string, username []byte, password []byte, shared []byte) (bool, error) {
-	return string(username) == "valid", nil
+func authHandler(c *Context) (bool, error) {
+	return string(c.Username()) == "valid", nil
 }
 
 // Test the extensions listed in response to an EHLO command.
@@ -913,14 +913,14 @@ func TestAuthMechs(t *testing.T) {
 	s.srv = &Server{}
 
 	// Validate that non-TLS (default) configuration does not allow plaintext authentication mechanisms.
-	correct := map[string]bool{"LOGIN": false, "PLAIN": false, "CRAM-MD5": true}
+	correct := map[AuthMech]bool{AuthLogin: false, AuthPlain: false, AuthCramMD5: true}
 	mechs := s.authMechs()
 	if !reflect.DeepEqual(mechs, correct) {
 		t.Errorf("authMechs() returned %v, want %v", mechs, correct)
 	}
 
 	// Validate that TLS configuration allows plaintext authentication mechanisms.
-	correct = map[string]bool{"LOGIN": true, "PLAIN": true, "CRAM-MD5": true}
+	correct = map[AuthMech]bool{AuthLogin: true, AuthPlain: true, AuthCramMD5: true}
 	s.c.tls = true
 	mechs = s.authMechs()
 	if !reflect.DeepEqual(mechs, correct) {
@@ -928,34 +928,34 @@ func TestAuthMechs(t *testing.T) {
 	}
 
 	// Validate that overridden values take precedence over RFC compliance when not using TLS.
-	correct = map[string]bool{"LOGIN": true, "PLAIN": true, "CRAM-MD5": false}
+	correct = map[AuthMech]bool{AuthLogin: true, AuthPlain: true, AuthCramMD5: false}
 	s.c.tls = false
-	s.srv.AuthMechs = map[string]bool{"LOGIN": true, "PLAIN": true, "CRAM-MD5": false}
+	s.srv.AuthMechs = map[AuthMech]bool{AuthLogin: true, AuthPlain: true, AuthCramMD5: false}
 	mechs = s.authMechs()
 	if !reflect.DeepEqual(mechs, correct) {
 		t.Errorf("authMechs() returned %v, want %v", mechs, correct)
 	}
 
 	// Validate that overridden values take precedence over RFC compliance when using TLS.
-	correct = map[string]bool{"LOGIN": false, "PLAIN": false, "CRAM-MD5": true}
+	correct = map[AuthMech]bool{AuthLogin: false, AuthPlain: false, AuthCramMD5: true}
 	s.c.tls = true
-	s.srv.AuthMechs = map[string]bool{"LOGIN": false, "PLAIN": false, "CRAM-MD5": true}
+	s.srv.AuthMechs = map[AuthMech]bool{AuthLogin: false, AuthPlain: false, AuthCramMD5: true}
 	mechs = s.authMechs()
 	if !reflect.DeepEqual(mechs, correct) {
 		t.Errorf("authMechs() returned %v, want %v", mechs, correct)
 	}
 
 	// Validate ability to explicitly disallow all mechanisms.
-	correct = map[string]bool{"LOGIN": false, "PLAIN": false, "CRAM-MD5": false}
-	s.srv.AuthMechs = map[string]bool{"LOGIN": false, "PLAIN": false, "CRAM-MD5": false}
+	correct = map[AuthMech]bool{AuthLogin: false, AuthPlain: false, AuthCramMD5: false}
+	s.srv.AuthMechs = map[AuthMech]bool{AuthLogin: false, AuthPlain: false, AuthCramMD5: false}
 	mechs = s.authMechs()
 	if !reflect.DeepEqual(mechs, correct) {
 		t.Errorf("authMechs() returned %v, want %v", mechs, correct)
 	}
 
 	// Validate ability to explicitly allow all mechanisms.
-	correct = map[string]bool{"LOGIN": true, "PLAIN": true, "CRAM-MD5": true}
-	s.srv.AuthMechs = map[string]bool{"LOGIN": true, "PLAIN": true, "CRAM-MD5": true}
+	correct = map[AuthMech]bool{AuthLogin: true, AuthPlain: true, AuthCramMD5: true}
+	s.srv.AuthMechs = map[AuthMech]bool{AuthLogin: true, AuthPlain: true, AuthCramMD5: true}
 	mechs = s.authMechs()
 	if !reflect.DeepEqual(mechs, correct) {
 		t.Errorf("authMechs() returned %v, want %v", mechs, correct)
